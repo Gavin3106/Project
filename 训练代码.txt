@@ -1,0 +1,867 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import List, Tuple, NamedTuple, Union
+import math
+import logging
+import os
+from tqdm import tqdm
+import random  # Added for shuffling data
+import psutil  # Added for memory usage tracking
+import time  # Added for runtime measurement
+
+# Configure logging to INFO level to reduce verbosity
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(message)s')
+
+# Enable CuDNN benchmark for optimized GPU performance
+torch.backends.cudnn.benchmark = True
+
+
+# ----------------------------
+# 一、定义棋盘类 ChessBoard
+# ----------------------------
+class ChessBoard:
+    def __init__(self, board_len: int = 15, n_feature_planes: int = 4, search_radius: int = 2):
+        self.board_len = board_len
+        self.current_player = 1  # 1 for black, -1 for white
+        self.state = np.zeros((board_len, board_len), dtype=np.int8)
+        self.n_feature_planes = n_feature_planes
+        self.search_radius = search_radius
+        self.available_actions = set(range(board_len * board_len))
+        self.candidate_positions = set()
+        self.move_history = []
+
+    def clear_board(self):
+        self.current_player = 1
+        self.state.fill(0)
+        self.available_actions = set(range(self.board_len * self.board_len))
+        self.candidate_positions = set()
+        self.move_history = []
+
+    def clone(self) -> 'ChessBoard':
+        new_board = ChessBoard(self.board_len, self.n_feature_planes, self.search_radius)
+        new_board.state = self.state.copy()
+        new_board.current_player = self.current_player
+        new_board.available_actions = self.available_actions.copy()
+        new_board.candidate_positions = self.candidate_positions.copy()
+        new_board.move_history = self.move_history.copy()
+        return new_board
+
+    def get_available_actions(self) -> List[int]:
+        if not self.move_history:
+            return list(self.available_actions)
+        return list(self.candidate_positions.intersection(self.available_actions))
+
+    def do_action(self, action: int, player: int = None) -> None:
+        """
+        执行一次棋步，同时更新棋盘状态和行动历史。
+        """
+        if action not in self.get_available_actions():
+            raise ValueError(f"Action {action} is not available")
+        if player is None:
+            player = self.current_player
+            self.current_player *= -1  # 切换玩家
+        x, y = divmod(action, self.board_len)
+        self.state[x, y] = player
+        self.available_actions.remove(action)
+        self.move_history.append(action)  # 确保记录每一步棋
+        logging.debug(f"Player {player} moved to ({x}, {y}). Next player: {self.current_player}")
+
+        # 更新候选位置
+        for dx in range(-self.search_radius, self.search_radius + 1):
+            for dy in range(-self.search_radius, self.search_radius + 1):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < self.board_len and 0 <= ny < self.board_len:
+                    pos = nx * self.board_len + ny
+                    if self.state[nx, ny] == 0:
+                        self.candidate_positions.add(pos)
+
+    def undo_action(self):
+        if self.move_history:
+            action = self.move_history.pop()
+            x, y = divmod(action, self.board_len)
+            self.state[x, y] = 0
+            self.current_player *= -1
+            self.available_actions.add(action)
+            # 重新计算候选位置，仅更新受影响的区域
+            self.candidate_positions = set()
+            for move in self.move_history:
+                mx, my = divmod(move, self.board_len)
+                for dx in range(-self.search_radius, self.search_radius + 1):
+                    for dy in range(-self.search_radius, self.search_radius + 1):
+                        nx, ny = mx + dx, my + dy
+                        if 0 <= nx < self.board_len and 0 <= ny < self.board_len:
+                            pos = nx * self.board_len + ny
+                            if self.state[nx, ny] == 0:
+                                self.candidate_positions.add(pos)
+
+    def is_game_over(self) -> Tuple[bool, Union[int, None]]:
+        directions = [(1, 0), (0, 1), (1, 1), (1, -1)]
+        for x in range(self.board_len):
+            for y in range(self.board_len):
+                player = self.state[x, y]
+                if player == 0:
+                    continue
+                for dx, dy in directions:
+                    count = 1
+                    # 正方向
+                    for step in range(1, 5):
+                        nx, ny = x + dx * step, y + dy * step
+                        if 0 <= nx < self.board_len and 0 <= ny < self.board_len:
+                            if self.state[nx, ny] == player:
+                                count += 1
+                            else:
+                                break
+                        else:
+                            break
+                    if count >= 5:
+                        return True, player
+        if not self.get_available_actions():
+            return True, None  # 平局
+        return False, None
+
+    def get_feature_planes(self) -> torch.Tensor:
+        planes = np.zeros((self.n_feature_planes, self.board_len, self.board_len), dtype=np.float32)
+        actions = np.argwhere(self.state != 0)
+        logging.debug(f"Current Player: {self.current_player}")
+        logging.debug(f"Actions on Board: {actions}")
+
+        if actions.size > 0:
+            x = actions[:, 0]
+            y = actions[:, 1]
+            planes[0, x, y] = (self.state[x, y] == self.current_player).astype(np.float32)
+            planes[1, x, y] = (self.state[x, y] == -self.current_player).astype(np.float32)
+
+        available = np.array(list(self.get_available_actions()))
+        if available.size > 0:
+            x_available = available // self.board_len
+            y_available = available % self.board_len
+            planes[2, x_available, y_available] = 1.0
+        else:
+            logging.debug("No available actions.")
+
+        # 添加启发式评分作为额外的特征平面
+        if self.n_feature_planes > 3:
+            heuristic_scores = self.compute_heuristic_scores()
+            planes[3] = heuristic_scores
+
+        # 打印每个特征平面的总和以调试
+        for i in range(self.n_feature_planes):
+            logging.debug(f"Feature Plane {i} Sum: {planes[i].sum()}")
+
+        return torch.tensor(planes, dtype=torch.float32)
+
+    def compute_heuristic_scores(self) -> np.ndarray:
+        available_actions = self.get_available_actions()
+        scores = np.zeros((self.board_len, self.board_len), dtype=np.float32)
+        if not available_actions:
+            return scores
+
+        for action in available_actions:
+            x, y = divmod(action, self.board_len)
+            self.do_action(action, player=self.current_player)
+            score = self.evaluate_action(self, action, self.current_player)
+            scores[x, y] = score
+            self.undo_action()
+
+        return scores
+
+    def evaluate_action(self, board: 'ChessBoard', action: int, player: int) -> float:
+        directions = [(1, 0), (0, 1), (1, 1), (1, -1)]
+        score_table = {
+            'existing_connections': {1: 1, 2: 5, 3: 50, 4: 10000},
+            'live_connections': {1: 10, 2: 100, 3: 500, 4: 10000},
+            'dead_connections': {1: 1, 2: 10, 3: 100, 4: 5000},
+            'jump_three': 200,
+            'jump_four': 5000,
+            'self_block': -50,
+            'opponent_block': -100,
+            'mixed_ends': 100,
+            'block_opponent_levels': {
+                2: 20,
+                3: 100,
+                4: 1000,
+                5: 5000
+            }
+        }
+
+        total_score = 0.0
+        x, y = divmod(action, board.board_len)
+
+        for dx, dy in directions:
+            conn_info = board.check_connection(x, y, dx, dy, player)
+            if conn_info:
+                existing_conn, live_conn, dead_conn, ends = conn_info
+                # 基础得分
+                total_score += (
+                        score_table['existing_connections'].get(existing_conn, 0) +
+                        score_table['live_connections'].get(live_conn, 0) +
+                        score_table['dead_connections'].get(dead_conn, 0)
+                )
+                # 特殊末端状态得分
+                if ends == (1, 1):
+                    total_score += score_table['self_block']
+                elif ends == (-1, -1):
+                    total_score += score_table['opponent_block']
+                elif ends in [(1, -1), (-1, 1)]:
+                    total_score += score_table['mixed_ends']
+
+            # 检测跳三、跳四
+            jump_three, jump_four = board.check_advanced_patterns(x, y, dx, dy, player)
+            total_score += jump_three * score_table['jump_three']
+            total_score += jump_four * score_table['jump_four']
+
+        # 新增阻挡对手逻辑
+        opponent = -player
+        for dx, dy in directions:
+            opponent_line_len = board.check_opponent_block(x, y, dx, dy, player)
+            for length_threshold, block_score in sorted(score_table['block_opponent_levels'].items(), reverse=True):
+                if opponent_line_len >= length_threshold:
+                    total_score += block_score
+                    break
+
+        return total_score
+
+    def check_advanced_patterns(self, x: int, y: int, dx: int, dy: int, player: int) -> Tuple[int, int]:
+        jump_three = 0
+        jump_four = 0
+        pattern = []
+
+        for i in range(-4, 5):
+            nx, ny = x + i * dx, y + i * dy
+            if 0 <= nx < self.board_len and 0 <= ny < self.board_len:
+                pattern.append(self.state[nx, ny])
+            else:
+                pattern.append(None)
+
+        # 检测跳三
+        for i in range(len(pattern) - 3):
+            segment = pattern[i:i + 4]
+            if None in segment:
+                continue
+            if segment == [player, 0, player, player] or segment == [player, player, 0, player]:
+                jump_three += 1
+
+        # 检测跳四
+        for i in range(len(pattern) - 4):
+            segment = pattern[i:i + 5]
+            if None in segment:
+                continue
+            if segment == [player, player, player, 0, player] or segment == [player, player, 0, player, player]:
+                jump_four += 1
+
+        return jump_three, jump_four
+
+    def check_connection(self, x: int, y: int, dx: int, dy: int, player: int) -> Tuple[int, int, int, Tuple[int, int]]:
+        count = 1  # 包括当前点
+        live_count = 0
+        dead_count = 0
+        ends = [0, 0]
+
+        # 正方向
+        nx, ny = x + dx, y + dy
+        while 0 <= nx < self.board_len and 0 <= ny < self.board_len and self.state[nx, ny] == player:
+            count += 1
+            nx += dx
+            ny += dy
+        if 0 <= nx < self.board_len and 0 <= ny < self.board_len:
+            ends[0] = self.state[nx, ny]
+            if ends[0] == 0:
+                live_count += 1
+            else:
+                dead_count += 1
+        else:
+            dead_count += 1
+
+        # 反方向
+        nx, ny = x - dx, y - dy
+        while 0 <= nx < self.board_len and 0 <= ny < self.board_len and self.state[nx, ny] == player:
+            count += 1
+            nx -= dx
+            ny -= dy
+        if 0 <= nx < self.board_len and 0 <= ny < self.board_len:
+            ends[1] = self.state[nx, ny]
+            if ends[1] == 0:
+                live_count += 1
+            else:
+                dead_count += 1
+        else:
+            dead_count += 1
+
+        return count, live_count, dead_count, tuple(ends)
+
+    def check_opponent_block(self, x: int, y: int, dx: int, dy: int, player: int) -> int:
+        opponent = -player
+        length = 1
+        # 正方向
+        nx, ny = x + dx, y + dy
+        while 0 <= nx < self.board_len and 0 <= ny < self.board_len and self.state[nx, ny] == opponent:
+            length += 1
+            nx += dx
+            ny += dy
+
+        # 反方向
+        nx, ny = x - dx, y - dy
+        while 0 <= nx < self.board_len and 0 <= ny < self.board_len and self.state[nx, ny] == opponent:
+            length += 1
+            nx -= dx
+            ny -= dy
+
+        return length
+
+
+# ----------------------------
+# 二、定义节点类 Node
+# ----------------------------
+class Node:
+    __slots__ = ['parent', 'children', 'c_puct', 'P', 'N', 'W', 'Q', 'U', 'score']
+
+    def __init__(self, parent=None, prior_prob=0.0, c_puct=1.4):
+        self.parent = parent
+        self.children = {}
+        self.c_puct = c_puct
+        self.P = prior_prob
+        self.N = 0
+        self.W = 0.0
+        self.Q = 0.0
+        self.U = 0.0
+        self.score = 0.0
+
+    def select(self) -> Tuple[int, 'Node']:
+        max_score = -float('inf')
+        best_action = -1
+        best_child = None
+        for action, child in self.children.items():
+            score = child.get_score()
+            if score > max_score:
+                max_score = score
+                best_action = action
+                best_child = child
+        return best_action, best_child
+
+    def expand(self, action_probs: List[Tuple[int, float]]):
+        for action, prob in action_probs:
+            if action not in self.children:
+                self.children[action] = Node(parent=self, prior_prob=prob, c_puct=self.c_puct)
+
+    def update(self, value: float):
+        self.N += 1
+        self.W += value
+        self.Q = self.W / self.N
+
+    def backup(self, value: float):
+        self.update(value)
+        if self.parent:
+            self.parent.backup(-value)
+
+    def is_leaf_node(self) -> bool:
+        return len(self.children) == 0
+
+    def get_score(self) -> float:
+        if self.parent is not None and self.parent.N > 0:
+            self.U = self.c_puct * self.P * math.sqrt(self.parent.N) / (1 + self.N)
+        else:
+            self.U = 0
+        self.score = self.Q + self.U
+        return self.score
+
+
+# ----------------------------
+# 三、定义策略-价值网络类 PolicyValueNet
+# ----------------------------
+class ResidualBlock(nn.Module):
+    def __init__(self, channels=64):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.batch_norm1 = nn.BatchNorm2d(channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.batch_norm2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.batch_norm1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.batch_norm2(out)
+        out += x
+        out = self.relu(out)
+        return out
+
+
+class PolicyHead(nn.Module):
+    def __init__(self, in_channels=64, board_len=15):
+        super(PolicyHead, self).__init__()
+        self.conv = nn.Conv2d(in_channels, 4, kernel_size=1, bias=False)
+        self.batch_norm = nn.BatchNorm2d(4)
+        self.relu = nn.ReLU(inplace=True)
+        self.fc = nn.Linear(4 * board_len * board_len, board_len * board_len)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.batch_norm(x)
+        x = self.relu(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return F.log_softmax(x, dim=1)
+
+
+class ValueHead(nn.Module):
+    def __init__(self, in_channels=64, board_len=15):
+        super(ValueHead, self).__init__()
+        self.conv = nn.Conv2d(in_channels, 2, kernel_size=1, bias=False)
+        self.batch_norm = nn.BatchNorm2d(2)
+        self.relu = nn.ReLU(inplace=True)
+        self.fc = nn.Sequential(
+            nn.Linear(2 * board_len * board_len, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 1),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.batch_norm(x)
+        x = self.relu(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+
+class PolicyValueNet(nn.Module):
+    def __init__(self, board_len=15, n_feature_planes=4):
+        super(PolicyValueNet, self).__init__()
+        self.board_len = board_len
+        self.conv = nn.Sequential(
+            nn.Conv2d(n_feature_planes, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        self.residues = nn.Sequential(
+            ResidualBlock(64),
+            ResidualBlock(64),
+            ResidualBlock(64),
+        )
+        self.policy_head = PolicyHead(in_channels=64, board_len=board_len)
+        self.value_head = ValueHead(in_channels=64, board_len=board_len)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.residues(x)
+        log_p, v = self.policy_head(x), self.value_head(x)
+        return log_p, v
+
+    def predict(self, chess_board: ChessBoard, device: torch.device):
+        state = chess_board.get_feature_planes().unsqueeze(0).to(device)
+        with torch.no_grad():
+            log_p, v = self.forward(state)
+        p = torch.exp(log_p).squeeze(0).cpu()
+        available = torch.tensor(chess_board.get_available_actions(), dtype=torch.long)
+        p_available = p[available]
+        if p_available.sum() > 0:
+            p_available = p_available / p_available.sum()
+        else:
+            p_available = torch.ones_like(p_available) / len(p_available)
+        pi_full = torch.zeros(self.board_len * self.board_len, dtype=torch.float32)
+        pi_full[available] = p_available
+        return pi_full.numpy(), v.item()
+
+    def save_model(self, path: str):
+        dir_path = os.path.dirname(path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+        torch.save({
+            'model_state_dict': self.state_dict(),
+        }, path)
+        logging.info(f"Model saved to {path}")
+
+    def load_model(self, path: str, device: torch.device):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Model path {path} does not exist.")
+        checkpoint = torch.load(path, map_location=device)
+        self.load_state_dict(checkpoint['model_state_dict'])
+        self.to(device)
+        self.eval()
+        logging.info(f"Model loaded from {path}")
+
+
+# ----------------------------
+# 四、定义AlphaZeroMCTS类
+# ----------------------------
+class AlphaZeroMCTS:
+    def __init__(self, policy_value_net: PolicyValueNet, c_puct: float = 1.4, n_iters: int = 20,
+                 is_self_play: bool = True, device: torch.device = torch.device("cpu")):
+        self.policy_value_net = policy_value_net
+        self.c_puct = c_puct
+        self.n_iters = n_iters
+        self.is_self_play = is_self_play
+        self.device = device
+        self.reset_root()
+
+    def reset_root(self):
+        self.root = Node()
+
+    def update_parameters(self, c_puct: float, n_iters: int):
+        self.c_puct = c_puct
+        self.n_iters = n_iters
+
+    def search(self, chess_board: ChessBoard):
+        node = self.root
+        board = chess_board.clone()
+        current_player = board.current_player  # 保存当前玩家
+
+        while not node.is_leaf_node():
+            try:
+                action, node = node.select()
+                board.do_action(action)
+            except ValueError as e:
+                logging.warning(f"MCTS search error: {e}")
+                return
+        game_over, winner = board.is_game_over()
+        if not game_over:
+            try:
+                action_probs, value = self.policy_value_net.predict(board, self.device)
+                available_actions = board.get_available_actions()
+                action_prob_pairs = list(zip(available_actions, action_probs[available_actions]))
+                node.expand(action_prob_pairs)
+            except Exception as e:
+                logging.warning(f"Error during node expansion: {e}")
+                value = 0
+        else:
+            if winner is None:
+                value = 0
+            elif winner == current_player:
+                value = 1
+            else:
+                value = -1
+        node.backup(value)
+
+    def get_action(self, chess_board: ChessBoard, temperature: float = 1.0) -> Tuple[int, np.ndarray]:
+        self.reset_root()
+        for _ in range(self.n_iters):
+            self.search(chess_board)
+
+        actions = list(self.root.children.keys())
+        visit_counts = np.array([self.root.children[a].N for a in actions])
+        if visit_counts.sum() == 0:
+            pi = np.ones_like(visit_counts) / len(visit_counts)
+            best_action = np.random.choice(actions)
+        else:
+            if temperature == 0:
+                best_action_idx = np.argmax(visit_counts)
+                best_action = actions[best_action_idx]
+                pi = np.zeros(len(actions))
+                pi[best_action_idx] = 1
+            else:
+                pi = visit_counts ** (1 / temperature)
+                pi /= pi.sum()
+                best_action = np.random.choice(actions, p=pi)
+
+        pi_full = np.zeros(chess_board.board_len * chess_board.board_len, dtype=np.float32)
+        for idx, a in enumerate(actions):
+            pi_full[a] = pi[idx]
+
+        return best_action, pi_full
+
+
+# ----------------------------
+# 五、自我博弈数据类
+# ----------------------------
+class SelfPlayData(NamedTuple):
+    pi_list: List[np.ndarray]
+    z_list: List[float]
+    feature_planes_list: List[np.ndarray]
+    move_history: List[int]
+
+
+def self_play_game(chess_board: ChessBoard, mcts: AlphaZeroMCTS, move_count_threshold: int = 10,
+                   max_moves: int = 50) -> SelfPlayData:
+    pi_list = []
+    z_list = []
+    feature_planes_list = []
+    move_count = 0
+    while True:
+        state_feature_planes = chess_board.get_feature_planes()
+        feature_planes_list.append(state_feature_planes.numpy())
+        temperature = 1.0 if move_count < move_count_threshold else 0.0
+        action, pi = mcts.get_action(chess_board, temperature)
+        pi_list.append(pi)
+        try:
+            chess_board.do_action(action)  # 自动切换玩家
+        except ValueError as e:
+            logging.warning(f"Error during do_action: {e}")
+            break
+        move_count += 1
+        game_over, winner = chess_board.is_game_over()
+        if game_over or move_count >= max_moves:
+            if winner is None:
+                z = 0
+            else:
+                z = 1 if winner == 1 else -1
+            z_list = [z * ((-1) ** i) for i in range(len(pi_list))]
+            return SelfPlayData(pi_list, z_list, feature_planes_list, chess_board.move_history.copy())
+
+
+# ----------------------------
+# 六、数据增强与训练
+# ----------------------------
+def rotate(data: np.ndarray) -> np.ndarray:
+    rotated = np.rot90(data, k=1, axes=(1, 2))
+    logging.debug(f"Rotated data:\n{rotated}")
+    return rotated
+
+
+def flip(data: np.ndarray) -> np.ndarray:
+    flipped = np.flip(data, axis=2)
+    logging.debug(f"Flipped data:\n{flipped}")
+    return flipped
+
+
+def augment_data(pi: np.ndarray, feature_planes: np.ndarray, board_len: int) -> List[Tuple[np.ndarray, np.ndarray]]:
+    augmented = []
+    for _ in range(4):
+        # 旋转
+        feature_rotated = rotate(feature_planes)
+        pi_rotated = np.rot90(pi.reshape(board_len, board_len), k=1).flatten()
+        if pi_rotated.sum() > 0:
+            pi_rotated /= pi_rotated.sum()
+        else:
+            pi_rotated = np.ones_like(pi_rotated) / len(pi_rotated)
+        augmented.append((pi_rotated.copy(), feature_rotated.copy()))
+
+        # 翻转
+        feature_flipped = flip(feature_rotated)
+        pi_flipped = np.flip(pi_rotated.reshape(board_len, board_len), axis=1).flatten()
+        if pi_flipped.sum() > 0:
+            pi_flipped /= pi_flipped.sum()
+        else:
+            pi_flipped = np.ones_like(pi_flipped) / len(pi_flipped)
+        augmented.append((pi_flipped.copy(), feature_flipped.copy()))
+
+        # 打印增强后的特征平面和策略分布
+        logging.debug(f"Augmented Pi:\n{pi_rotated}")
+        logging.debug(f"Augmented Feature Planes:\n{feature_rotated}")
+
+    return augmented
+
+
+def visualize_game(move_history: List[int], board_len: int, title: str = "Game Visualization"):
+    """
+    可视化游戏过程，标注每一步的序号。
+    """
+    board = np.zeros((board_len, board_len), dtype=np.int8)
+    fig, ax = plt.subplots(figsize=(8, 8))
+    plt.title(title)
+    ax.set_xlim(-0.5, board_len - 0.5)
+    ax.set_ylim(-0.5, board_len - 0.5)
+    ax.set_xticks(range(board_len))
+    ax.set_yticks(range(board_len))
+    ax.grid(True)
+
+    for move_num, action in enumerate(move_history):
+        x, y = divmod(action, board_len)
+        player = 1 if move_num % 2 == 0 else -1
+        board[x, y] = player
+        color = 'black' if player == 1 else 'white'
+        ax.scatter(y, board_len - 1 - x, c=color, edgecolors='k', s=200)
+        ax.text(y, board_len - 1 - x, str(move_num + 1), va='center', ha='center', fontsize=8)
+
+    plt.gca().invert_yaxis()
+    plt.show()
+
+
+def visualize_policy_distribution(pi: np.ndarray, board_len: int,
+                                  title: str = "Policy Distribution"):
+    """
+    可视化策略分布，仅显示策略分布，不显示任何特征平面。
+    """
+    fig, ax = plt.subplots(figsize=(6, 6))
+    fig.suptitle(title, fontsize=16)
+
+    # 可视化策略分布
+    pi_grid = pi.reshape(board_len, board_len)
+    im = ax.imshow(pi_grid, cmap='hot', interpolation='nearest')
+    ax.set_title('Policy Distribution')
+    ax.axis('off')
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    plt.show()
+
+
+def augment_and_prepare_batch(batch: List[SelfPlayData], board_len: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    对批次数据进行数据增强，并准备训练所需的numpy数组。
+    """
+    pi_batch = []
+    feature_batch = []
+    z_batch = []
+    for data in batch:
+        for pi, fp, z in zip(data.pi_list, data.feature_planes_list, data.z_list):
+            augmented_samples = augment_data(pi, fp, board_len)
+            for pi_aug, fp_aug in augmented_samples:
+                pi_batch.append(pi_aug)
+                feature_batch.append(fp_aug)
+                z_batch.append(z)
+    return np.array(feature_batch, dtype=np.float32), np.array(pi_batch, dtype=np.float32), np.array(z_batch,
+                                                                                                     dtype=np.float32)
+
+
+def initialize_weights(module):
+    if isinstance(module, nn.Conv2d):
+        nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0)
+    elif isinstance(module, nn.BatchNorm2d):
+        nn.init.constant_(module.weight, 1)
+        nn.init.constant_(module.bias, 0)
+    elif isinstance(module, nn.Linear):
+        nn.init.xavier_uniform_(module.weight)
+        nn.init.constant_(module.bias, 0)
+
+
+# ----------------------------
+# 七、训练函数
+# ----------------------------
+def train(model, data_buffer: List[SelfPlayData], board_len, epochs, batch_size, lr, patience, device):
+    """
+    实现训练循环，包括数据加载、数据增强、前向传播、损失计算、反向传播和优化步骤。
+    """
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion_policy = nn.KLDivLoss(reduction='batchmean')
+    criterion_value = nn.MSELoss()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=patience, factor=0.5)
+
+    loss_history = []  # To store loss values
+
+    for epoch in range(epochs):
+        logging.info(f"Epoch {epoch + 1}/{epochs} started...")
+        epoch_loss = 0.0
+        total_samples = 0
+        # Shuffle data_buffer to randomize training
+        random.shuffle(data_buffer)
+        for i in tqdm(range(0, len(data_buffer), batch_size), desc=f"Epoch {epoch + 1}/{epochs}", unit="batch"):
+            batch = data_buffer[i:i + batch_size]
+            # 添加训练样本调试信息
+            logging.debug(f"Processing batch {i // batch_size + 1}, size: {len(batch)}")
+            feature_planes, pis, zs = augment_and_prepare_batch(batch, board_len)
+            feature_tensor = torch.tensor(feature_planes, dtype=torch.float32).to(device)
+            pi_tensor = torch.tensor(pis, dtype=torch.float32).to(device)
+            z_tensor = torch.tensor(zs, dtype=torch.float32).to(device)
+
+            optimizer.zero_grad()
+            log_p, v = model(feature_tensor)
+            loss_policy = criterion_policy(log_p, pi_tensor)
+            loss_value = criterion_value(v.squeeze(), z_tensor)
+            loss = loss_policy + loss_value
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item() * len(batch)
+            loss_history.append(loss.item())
+            total_samples += len(batch)
+
+        avg_loss = epoch_loss / total_samples
+        logging.warning(f"Epoch {epoch + 1}/{epochs}, Avg Loss: {avg_loss:.4f}")
+        scheduler.step(avg_loss)
+
+    return loss_history  # Return loss history for plotting
+
+
+# ----------------------------
+# 八、主函数
+# ----------------------------
+def main():
+    # 定义核心参数
+    board_len = 15
+    n_feature_planes = 4
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Define parameters
+    n_self_play_games = 100  # 自我博弈的游戏数量
+    games_to_visualize = [1, 30, 100]  # Games to visualize
+
+    policy_value_net = PolicyValueNet(board_len=board_len, n_feature_planes=n_feature_planes).to(device)
+    initialize_weights(policy_value_net)
+
+    data_buffer = []
+    games_to_store = {}  # Store games to visualize
+
+    # Self-play data generation
+    logging.info("Starting self-play data generation...")
+
+    mcts = AlphaZeroMCTS(policy_value_net, c_puct=1.4, n_iters=20, is_self_play=True, device=device)
+
+    start_time = time.time()
+    process = psutil.Process(os.getpid())
+
+    for game_id in tqdm(range(1, n_self_play_games + 1), desc="Generating self-play games"):
+        chess_board = ChessBoard(board_len=board_len)
+        data = self_play_game(chess_board, mcts)
+        data_buffer.append(data)
+        if game_id in games_to_visualize:
+            games_to_store[game_id] = data
+    end_time = time.time()
+
+    runtime = end_time - start_time
+    memory_usage = process.memory_info().rss / (1024 ** 2)  # in MB
+
+    logging.info(f"Self-play data generation completed in {runtime:.2f} seconds.")
+    logging.info(f"Current memory usage: {memory_usage:.2f} MB.")
+
+    # Visualize selected games (仅绘制棋盘，不显示任何特征平面)
+    for game_id in games_to_visualize:
+        if game_id in games_to_store:
+            game_data = games_to_store[game_id]
+            logging.info(f"Visualizing game {game_id}...")
+            visualize_game(game_data.move_history, board_len, title=f"Self-Play Game {game_id}")
+        else:
+            logging.warning(f"Game {game_id} not found in games_to_store.")
+
+    # Start training
+    logging.info("Starting training...")
+
+    # Measure memory and runtime during training
+    train_start_time = time.time()
+    train_memory_before = process.memory_info().rss / (1024 ** 2)  # in MB
+
+    loss_history = train(policy_value_net, data_buffer, board_len, epochs=20, batch_size=16, lr=1e-3, patience=3, device=device)
+
+    train_end_time = time.time()
+    train_runtime = train_end_time - train_start_time
+    train_memory_after = process.memory_info().rss / (1024 ** 2)  # in MB
+    train_memory_used = train_memory_after - train_memory_before
+
+    logging.info(f"Training completed in {train_runtime:.2f} seconds.")
+    logging.info(f"Memory used during training: {train_memory_used:.2f} MB.")
+
+    # Plot training loss
+    plt.figure(figsize=(10, 5))
+    plt.plot(loss_history, label='Training Loss')
+    plt.xlabel('Iterations')
+    plt.ylabel('Loss')
+    plt.title('Training Loss over Time')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # Save model
+    try:
+        policy_value_net.save_model("policy_value_net.pth")
+    except Exception as e:
+        logging.warning(f"Error saving model: {e}")
+    logging.warning("Model saved as 'policy_value_net.pth'.")
+
+    # Optionally, visualize data augmentation for a sample
+    # 修改为仅可视化策略分布，而不显示任何特征平面
+    if data_buffer:
+        first_game = data_buffer[0]
+        if first_game.pi_list:
+            sample_pi = first_game.pi_list[0]
+            visualize_policy_distribution(sample_pi, board_len, title="Sample Policy Distribution")
+
+
+if __name__ == "__main__":
+    main()
